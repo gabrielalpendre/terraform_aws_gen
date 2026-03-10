@@ -63,10 +63,13 @@ def gerar_dados_lambda(resource_name, client):
     try:
         response = client.get_function(FunctionName=function_name)
         config = response['Configuration']
+        code_info = response.get('Code', {})
         env_vars = config.get('Environment', {}).get('Variables', {})
         layers = [layer['Arn'] for layer in config.get('Layers', [])]
 
         filesystem_configs = [{ 'arn': fsc['Arn'], 'local_mount_path': fsc['LocalMountPath'] } for fsc in config.get('FileSystemConfigs', [])]
+
+        package_type = config.get('PackageType')
 
         return {
             "function_name": config['FunctionName'],
@@ -77,6 +80,9 @@ def gerar_dados_lambda(resource_name, client):
             "architectures": config.get('Architectures', ['x86_64']),
             "timeout": config.get('Timeout', 3),
             "memory_size": config.get('MemorySize', 128),
+            "package_type": package_type,
+            "image_uri": code_info.get('ImageUri') if package_type == 'Image' else None,
+            "source_code_hash": config.get('CodeSha256'),
             "environment_variables": env_vars,
             "dead_letter_config": config.get('DeadLetterConfig', {}),
             "kms_key_arn": config.get('KMSKeyArn', ''),
