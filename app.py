@@ -8,7 +8,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 def gerar_dados_s3(resource_name, client):
     """
-    Busca informações de um bucket S3 e retorna um dicionário com seus atributos.
+    Busca informações de um bucket S3. resource_name deve ser um dict com a chave 'name'.
     """
     bucket_name = resource_name
     logging.info(f"Buscando detalhes para o bucket S3: {bucket_name}...")
@@ -34,9 +34,9 @@ def gerar_dados_s3(resource_name, client):
 
 def gerar_dados_lambda(resource_name, client):
     """
-    Busca informações de uma função Lambda e retorna um dicionário com seus atributos.
+    Busca informações de uma função Lambda. resource_name deve ser um dict com a chave 'name'.
     """
-    function_name = resource_name
+    function_name = resource_name['name']
     logging.info(f"Buscando detalhes para a função Lambda: {function_name}...")
     try:
         response = client.get_function(FunctionName=function_name)
@@ -111,8 +111,8 @@ def gerar_dados_wafv2(resource_name, client):
         return None
 
 def gerar_dados_vpc_subnet(resource_name, client):
-    """Busca informações de uma Subnet de VPC."""
-    subnet_id = resource_name
+    """Busca informações de uma Subnet de VPC. resource_name deve ser um dict com a chave 'id'."""
+    subnet_id = resource_name['id']
     logging.info(f"Buscando detalhes para a Subnet: {subnet_id}...")
     try:
         response = client.describe_subnets(SubnetIds=[subnet_id])
@@ -132,8 +132,8 @@ def gerar_dados_vpc_subnet(resource_name, client):
         return None
 
 def gerar_dados_load_balancer(resource_name, client):
-    """Busca informações de um Load Balancer (ALB/NLB)."""
-    lb_arn = resource_name
+    """Busca informações de um Load Balancer (ALB/NLB). resource_name deve ser um dict com a chave 'arn'."""
+    lb_arn = resource_name['arn']
     logging.info(f"Buscando detalhes para o Load Balancer: {lb_arn}...")
     try:
         lb_response = client.describe_load_balancers(LoadBalancerArns=[lb_arn])
@@ -168,8 +168,8 @@ def gerar_dados_load_balancer(resource_name, client):
         return None
 
 def gerar_dados_ecs_task_definition(resource_name, client):
-    """Busca informações de uma Task Definition do ECS."""
-    task_def_name = resource_name
+    """Busca informações de uma Task Definition do ECS. resource_name deve ser um dict com a chave 'name'."""
+    task_def_name = resource_name['name']
     logging.info(f"Buscando detalhes para a Task Definition: {task_def_name}...")
     try:
         response = client.describe_task_definition(taskDefinition=task_def_name)
@@ -234,8 +234,8 @@ def gerar_dados_ecs_service(resource_name, client):
         return None
 
 def gerar_dados_cloudfront(resource_name, client):
-    """Busca informações de uma Distribuição CloudFront."""
-    dist_id = resource_name
+    """Busca informações de uma Distribuição CloudFront. resource_name deve ser um dict com a chave 'id'."""
+    dist_id = resource_name['id']
     logging.info(f"Buscando detalhes para a Distribuição CloudFront: {dist_id}...")
     try:
         response = client.get_distribution_config(Id=dist_id)
@@ -265,8 +265,8 @@ def gerar_dados_cloudfront(resource_name, client):
         return None
 
 def gerar_dados_api_gateway(resource_name, client):
-    """Busca informações de uma REST API do API Gateway."""
-    api_name = resource_name
+    """Busca informações de uma REST API do API Gateway. resource_name deve ser um dict com a chave 'name'."""
+    api_name = resource_name['name']
     logging.info(f"Buscando detalhes para a API Gateway REST API: {api_name}...")
     try:
         # Encontra a API pelo nome
@@ -298,8 +298,8 @@ def gerar_dados_api_gateway(resource_name, client):
         return None
 
 def gerar_dados_kms_key(resource_name, client):
-    """Busca informações de uma chave KMS."""
-    key_id_or_alias = resource_name
+    """Busca informações de uma chave KMS. resource_name deve ser um dict com a chave 'alias', 'id' ou 'arn'."""
+    key_id_or_alias = resource_name.get('alias') or resource_name.get('id') or resource_name.get('arn')
     logging.info(f"Buscando detalhes para a chave KMS: {key_id_or_alias}...")
     try:
         response = client.describe_key(KeyId=key_id_or_alias)
@@ -324,8 +324,8 @@ def gerar_dados_kms_key(resource_name, client):
         return None
 
 def gerar_dados_sns_topic(resource_name, client):
-    """Busca informações de um tópico SNS."""
-    topic_arn = resource_name
+    """Busca informações de um tópico SNS. resource_name deve ser um dict com a chave 'arn'."""
+    topic_arn = resource_name['arn']
     logging.info(f"Buscando detalhes para o Tópico SNS: {topic_arn}...")
     try:
         attributes = client.get_topic_attributes(TopicArn=topic_arn)['Attributes']
@@ -337,7 +337,7 @@ def gerar_dados_sns_topic(resource_name, client):
             "tags": tags,
         }
     except ClientError as e:
-        logging.error(f"Não foi possível encontrar ou acessar a Distribuição '{dist_id}': {e}")
+        logging.error(f"Não foi possível encontrar ou acessar o Tópico SNS '{topic_arn}': {e}")
         return None
 
 RESOURCE_MAP = {
@@ -429,11 +429,18 @@ def main(yaml_file, output_dir):
             boto_clients[client_name] = boto3.client(client_name, region_name="us-east-1")
         client = boto_clients[client_name]
 
-        for resource_name in resource_list:
-            module_name_suffix = resource_name if isinstance(resource_name, str) else resource_name.get('name', resource_name.get('service', 'default'))
-            safe_module_name = "".join(c if c.isalnum() else '_' for c in module_name_suffix)
+        for resource_item in resource_list:
+            # A chave principal para nomear o módulo (ex: 'name', 'id', 'arn', 'service')
+            # A ordem define a preferência.
+            name_keys = ['name', 'service', 'id', 'arn', 'alias']
+            module_name_suffix = 'default'
+            for key in name_keys:
+                if key in resource_item:
+                    module_name_suffix = resource_item[key].split('/')[-1] # Pega a última parte de ARNs/aliases
+                    break
 
-            data_dict = generator_func(resource_name, client)
+            safe_module_name = "".join(c if c.isalnum() else '_' for c in module_name_suffix)
+            data_dict = generator_func(resource_item, client)
 
             if data_dict:
                 module_path = os.path.join(output_dir, 'modules', resource_type, safe_module_name)
