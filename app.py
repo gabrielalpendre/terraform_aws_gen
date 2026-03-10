@@ -63,10 +63,24 @@ def gerar_dados_lambda(resource_name, client):
     try:
         response = client.get_function(FunctionName=function_name)
         config = response['Configuration']
+        code_info = response.get('Code', {})
         env_vars = config.get('Environment', {}).get('Variables', {})
         layers = [layer['Arn'] for layer in config.get('Layers', [])]
 
         filesystem_configs = [{ 'arn': fsc['Arn'], 'local_mount_path': fsc['LocalMountPath'] } for fsc in config.get('FileSystemConfigs', [])]
+
+        package_type = config.get('PackageType')
+        image_uri = None
+        s3_bucket = None
+        s3_key = None
+        code_sha_256 = None
+        code_size = None
+
+        if package_type == 'Image':
+            image_uri = code_info.get('ImageUri')
+        elif package_type == 'Zip':
+            code_sha_256 = config.get('CodeSha256')
+            code_size = config.get('CodeSize')
 
         return {
             "function_name": config['FunctionName'],
@@ -83,6 +97,12 @@ def gerar_dados_lambda(resource_name, client):
             "tracing_config": config.get('TracingConfig', {}),
             "layers": layers,
             "filesystem_configs": filesystem_configs,
+            "package_type": package_type,
+            "image_uri": image_uri,
+            "s3_bucket": s3_bucket,
+            "s3_key": s3_key,
+            "code_sha_256": code_sha_256,
+            "code_size": code_size,
             "vpc_config": config.get('VpcConfig', {}),
             "tags": response.get('Tags', {})
         }
@@ -122,7 +142,7 @@ def gerar_dados_wafv2(resource_name, client):
             "name": web_acl['Name'],
             "description": web_acl.get('Description', ''),
             "scope": scope,
-            "default_action": {k.lower(): v for k, v in web_acl['DefaultAction'].items()},
+            "default_action": _processar_regras_recursivamente(web_acl['DefaultAction']),
             "visibility_config": {
                 "cloudwatch_metrics_enabled": web_acl['VisibilityConfig']['CloudWatchMetricsEnabled'],
                 "metric_name": web_acl['VisibilityConfig']['MetricName'],
@@ -450,7 +470,14 @@ def main(yaml_file, output_dir):
     with open(yaml_file, 'r') as f:
         resources_to_generate = yaml.safe_load(f)
 
-    root_main_tf_content = ""
+    main_tf_path = os.path.join(output_dir, 'main.tf')
+    new_module_blocks = []
+    existing_main_tf_content = ""
+
+    if os.path.exists(main_tf_path):
+        with open(main_tf_path, 'r') as f:
+            existing_main_tf_content = f.read()
+
     boto_clients = {}
 
     for resource_type, resource_list in resources_to_generate.items():
@@ -495,14 +522,21 @@ def main(yaml_file, output_dir):
                 
                 logging.info(f"Módulo '{safe_module_name}' gerado em: {module_path}")
 
-                root_main_tf_content += f'\nmodule "{resource_type}_{safe_module_name}" {{\n  source = "./modules/{resource_type}/{safe_module_name}"\n}}\n'
+                module_declaration_name = f'module "{resource_type}_{safe_module_name}"'
+                if module_declaration_name in existing_main_tf_content:
+                    logging.info(f"Declaração para o módulo '{resource_type}_{safe_module_name}' já existe em '{main_tf_path}'. Pulando.")
+                else:
+                    module_block = f'\nmodule "{resource_type}_{safe_module_name}" {{\n  source = "./modules/{resource_type}/{safe_module_name}"\n}}\n'
+                    new_module_blocks.append(module_block)
 
-    main_tf_path = os.path.join(output_dir, 'main.tf')
-    with open(main_tf_path, 'w') as f:
-        f.write("# Arquivo gerado automaticamente.\n" + root_main_tf_content)
-
-    logging.info("Geração de código concluída!")
-    logging.info(f"O arquivo '{main_tf_path}' foi populado com sucesso.")
+    if new_module_blocks:
+        with open(main_tf_path, 'a') as f:
+            if not existing_main_tf_content:
+                f.write("# Arquivo raiz do Terraform. Módulos podem ser adicionados aqui.\n")
+            f.writelines(new_module_blocks)
+        logging.info(f"{len(new_module_blocks)} novo(s) módulo(s) foram adicionados ao arquivo '{main_tf_path}'.")
+    else:
+        logging.info("Nenhum novo módulo para adicionar ao 'main.tf'.")
 
 if __name__ == '__main__':
     INPUT_YAML = 'resources.yaml'
