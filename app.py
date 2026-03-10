@@ -460,15 +460,10 @@ RESOURCE_MAP = {
     },
 }
 
-def criar_diretorios(base_path):
-    """Garante que a estrutura de diretórios para os módulos exista."""
-    os.makedirs(os.path.join(base_path, 'modules'), exist_ok=True)
 
 def main(yaml_file, output_dir):
     """Função principal que orquestra a geração do Terraform."""
     logging.info(f"Iniciando geração de Terraform a partir de '{yaml_file}'")
-    criar_diretorios(output_dir)
-    _ensure_requests_installed()
 
     with open(yaml_file, 'r') as f:
         resources_to_generate = yaml.safe_load(f)
