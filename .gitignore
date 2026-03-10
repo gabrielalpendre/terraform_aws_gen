@@ -1,0 +1,35 @@
+# Ignore Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+*.egg
+
+# Ignore Python virtual environments
+env/
+venv/
+.env
+
+# Ignore build artifacts
+dist/
+build/
+
+# Ignore Terraform state and configuration files
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.lock.hcl
+
+## Sensible content
+terraform/modules/
+terraform/main.tf
+resources.yaml
