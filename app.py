@@ -13,18 +13,40 @@ def gerar_dados_s3(resource_name, client):
     bucket_name = resource_name['name']
     logging.info(f"Buscando detalhes para o bucket S3: {bucket_name}...")
     try:
-
+        tags = {}
         try:
             tags_response = client.get_bucket_tagging(Bucket=bucket_name)
             tags = {tag['Key']: tag['Value'] for tag in tags_response.get('TagSet', [])}
         except ClientError as e:
-            if e.response['Error']['Code'] == 'NoSuchTagSet' or e.response['Error']['Code'] == 'AuthorizationHeaderMalformed':
-                tags = {}
+            if e.response['Error']['Code'] not in ['NoSuchTagSet', 'AuthorizationHeaderMalformed']:
+                logging.warning(f"Não foi possível obter tags para o bucket {bucket_name}: {e}")
+
+        versioning = client.get_bucket_versioning(Bucket=bucket_name).get('Status', 'Disabled')
+
+        try:
+            encryption = client.get_bucket_encryption(Bucket=bucket_name)['ServerSideEncryptionConfiguration']
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ServerSideEncryptionConfigurationNotFoundError':
+                encryption = None
             else:
-                raise
+                logging.warning(f"Não foi possível obter configuração de criptografia para {bucket_name}: {e}")
+                encryption = None
+
+        try:
+            policy_str = client.get_bucket_policy(Bucket=bucket_name).get('Policy')
+            policy = yaml.safe_load(policy_str) if policy_str else None
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchBucketPolicy':
+                policy = None
+            else:
+                logging.warning(f"Não foi possível obter política do bucket {bucket_name}: {e}")
+                policy = None
 
         return {
             "bucket": bucket_name,
+            "versioning_status": versioning,
+            "server_side_encryption_configuration": _processar_regras_recursivamente(encryption),
+            "policy": policy,
             "tags": tags
         }
 
@@ -42,6 +64,9 @@ def gerar_dados_lambda(resource_name, client):
         response = client.get_function(FunctionName=function_name)
         config = response['Configuration']
         env_vars = config.get('Environment', {}).get('Variables', {})
+        layers = [layer['Arn'] for layer in config.get('Layers', [])]
+
+        filesystem_configs = [{ 'arn': fsc['Arn'], 'local_mount_path': fsc['LocalMountPath'] } for fsc in config.get('FileSystemConfigs', [])]
 
         return {
             "function_name": config['FunctionName'],
@@ -53,6 +78,11 @@ def gerar_dados_lambda(resource_name, client):
             "timeout": config.get('Timeout', 3),
             "memory_size": config.get('MemorySize', 128),
             "environment_variables": env_vars,
+            "dead_letter_config": config.get('DeadLetterConfig', {}),
+            "kms_key_arn": config.get('KMSKeyArn', ''),
+            "tracing_config": config.get('TracingConfig', {}),
+            "layers": layers,
+            "filesystem_configs": filesystem_configs,
             "vpc_config": config.get('VpcConfig', {}),
             "tags": response.get('Tags', {})
         }
@@ -184,12 +214,14 @@ def gerar_dados_ecs_task_definition(resource_name, client):
             "task_role_arn": task_def.get('taskRoleArn'),
             "execution_role_arn": task_def.get('executionRoleArn'),
             "requires_compatibilities": task_def.get('requiresCompatibilities', []),
-            "volumes": task_def.get('volumes', []),
+            "volumes": _processar_regras_recursivamente(task_def.get('volumes', [])),
+            "placement_constraints": _processar_regras_recursivamente(task_def.get('placementConstraints', [])),
+            "proxy_configuration": _processar_regras_recursivamente(task_def.get('proxyConfiguration')),
             "tags": {tag['key']: tag['value'] for tag in task_def.get('tags', [])}
         }
 
     except ClientError as e:
-        logging.error(f"Não foi possível encontrar ou acessar a Task Definition '{task_def_name}': {e}")
+        logging.error(f"Não foi possível encontrar ou acessar a Task Definition '{task_def_name}': {e}", exc_info=True)
         return None
 
 def gerar_dados_ecs_service(resource_name, client):
@@ -198,16 +230,14 @@ def gerar_dados_ecs_service(resource_name, client):
     service_name = resource_name.get('service')
     logging.info(f"Buscando detalhes para o Service ECS: {service_name} no cluster {cluster_name}...")
     try:
-        response = client.describe_services(cluster=cluster_name, services=[service_name])
+        response = client.describe_services(cluster=cluster_name, services=[service_name], include=['TAGS'])
         if not response.get('services'):
             logging.error(f"Service ECS '{service_name}' no cluster '{cluster_name}' não encontrado.")
             return None
         service = response['services'][0]
 
-        # Extrai a configuração de rede, se existir
         net_config = service.get('networkConfiguration', {}).get('awsvpcConfiguration', {})
 
-        # Extrai os load balancers
         load_balancers = [
             {
                 "target_group_arn": lb.get('targetGroupArn'),
@@ -216,10 +246,15 @@ def gerar_dados_ecs_service(resource_name, client):
             } for lb in service.get('loadBalancers', [])
         ]
 
+        deployment_controller = service.get('deploymentController', {})
+        if deployment_controller.get('type') == 'CODE_DEPLOY':
+            pass
         return {
             "name": service['serviceName'],
             "cluster": cluster_name,
             "task_definition": service.get('taskDefinition'),
+            "scheduling_strategy": service.get('schedulingStrategy', 'REPLICA'),
+            "deployment_configuration": _processar_regras_recursivamente(service.get('deploymentConfiguration')),
             "desired_count": service.get('desiredCount', 1),
             "launch_type": service.get('launchType', 'FARGATE'),
             "network_configuration": {
@@ -228,6 +263,13 @@ def gerar_dados_ecs_service(resource_name, client):
                 "assign_public_ip": net_config.get('assignPublicIp') == 'ENABLED',
             },
             "load_balancers": load_balancers,
+            "deployment_controller": deployment_controller,
+            "service_registries": _processar_regras_recursivamente(service.get('serviceRegistries', [])),
+            "health_check_grace_period_seconds": service.get('healthCheckGracePeriodSeconds'),
+            "enable_ecs_managed_tags": service.get('enableECSManagedTags', False),
+            "enable_execute_command": service.get('enableExecuteCommand', False),
+            "propagate_tags": service.get('propagateTags'),
+            "tags": {tag['key']: tag['value'] for tag in service.get('tags', [])}
         }
     except ClientError as e:
         logging.error(f"Não foi possível encontrar ou acessar o Service ECS '{service_name}': {e}")
@@ -269,7 +311,6 @@ def gerar_dados_api_gateway(resource_name, client):
     api_name = resource_name['name']
     logging.info(f"Buscando detalhes para a API Gateway REST API: {api_name}...")
     try:
-        # Encontra a API pelo nome
         apis = client.get_rest_apis()
         api_item = next((item for item in apis['items'] if item['name'] == api_name), None)
         if not api_item:
@@ -277,10 +318,9 @@ def gerar_dados_api_gateway(resource_name, client):
             return None
         api_id = api_item['id']
 
-        # Exporta a definição da API no formato OpenAPI 3.0
         export = client.get_export(
             restApiId=api_id,
-            stageName='prod', # Um stage é necessário, pode ser necessário ajustar
+            stageName='prod',
             exportType='oas30',
             parameters={'extensions': 'integrations,authorizers'}
         )
@@ -411,7 +451,6 @@ def main(yaml_file, output_dir):
         resources_to_generate = yaml.safe_load(f)
 
     root_main_tf_content = ""
-    # Cache de clientes Boto3 para reutilização
     boto_clients = {}
 
     for resource_type, resource_list in resources_to_generate.items():
@@ -424,14 +463,11 @@ def main(yaml_file, output_dir):
         template_file = config['template']
         client_name = config['client']
 
-        # Reutiliza ou cria o cliente Boto3
         if client_name not in boto_clients:
             boto_clients[client_name] = boto3.client(client_name, region_name="us-east-1")
         client = boto_clients[client_name]
 
         for resource_item in resource_list:
-            # A chave principal para nomear o módulo (ex: 'name', 'id', 'arn', 'service')
-            # A ordem define a preferência.
             name_keys = ['name', 'service', 'id', 'arn', 'alias']
             module_name_suffix = 'default'
             for key in name_keys:
