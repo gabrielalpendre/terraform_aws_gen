@@ -41,20 +41,38 @@ def gerar_dados_lambda(resource_name, client):
     try:
         response = client.get_function(FunctionName=function_name)
         config = response['Configuration']
+        env_vars = config.get('Environment', {}).get('Variables', {})
 
         return {
             "function_name": config['FunctionName'],
+            "description": config.get('Description', ''),
             "role": config['Role'],
             "handler": config['Handler'],
             "runtime": config['Runtime'],
+            "architectures": config.get('Architectures', ['x86_64']),
             "timeout": config.get('Timeout', 3),
             "memory_size": config.get('MemorySize', 128),
+            "environment_variables": env_vars,
+            "vpc_config": config.get('VpcConfig', {}),
             "tags": response.get('Tags', {})
         }
 
     except ClientError as e:
         logging.error(f"Não foi possível encontrar ou acessar a função Lambda '{function_name}': {e}")
         return None
+
+def _processar_regras_recursivamente(obj):
+    """Converte recursivamente as chaves de um objeto de PascalCase para snake_case."""
+    if isinstance(obj, dict):
+        new_dict = {}
+        for k, v in obj.items():
+            new_key = ''.join(['_' + c.lower() if c.isupper() else c for c in k]).lstrip('_')
+            new_dict[new_key] = _processar_regras_recursivamente(v)
+        return new_dict
+    elif isinstance(obj, list):
+        return [_processar_regras_recursivamente(elem) for elem in obj]
+    else:
+        return obj
 
 def gerar_dados_wafv2(resource_name, client):
     """
@@ -67,18 +85,28 @@ def gerar_dados_wafv2(resource_name, client):
     try:
         response = client.get_web_acl(Name=acl_name, Scope=scope, Id=acl_id)
         web_acl = response['WebACL']
+        tags_response = client.list_tags_for_resource(ResourceARN=web_acl['ARN'])
+        tags = {tag['Key']: tag['Value'] for tag in tags_response.get('TagInfo', {}).get('TagList', [])}
+
         return {
             "name": web_acl['Name'],
-            "scope": web_acl['Scope'],
+            "description": web_acl.get('Description', ''),
+            "scope": scope,
             "default_action": {k.lower(): v for k, v in web_acl['DefaultAction'].items()},
             "visibility_config": {
                 "cloudwatch_metrics_enabled": web_acl['VisibilityConfig']['CloudWatchMetricsEnabled'],
                 "metric_name": web_acl['VisibilityConfig']['MetricName'],
                 "sampled_requests_enabled": web_acl['VisibilityConfig']['SampledRequestsEnabled'],
             },
-            # Rules são complexas e omitidas para simplicidade inicial.
+            "custom_response_bodies": _processar_regras_recursivamente(web_acl.get('CustomResponseBodies', {})),
+            "rules": _processar_regras_recursivamente(web_acl.get('Rules', [])),
+            "tags": tags,
         }
     except ClientError as e:
+        if e.response['Error']['Code'] == 'WAFNonexistentItemException':
+            logging.error(f"A WebACL '{acl_name}' com ID '{acl_id}' e escopo '{scope}' não foi encontrada.")
+            return None
+
         logging.error(f"Não foi possível encontrar ou acessar a WebACL '{acl_name}': {e}")
         return None
 
@@ -115,12 +143,21 @@ def gerar_dados_load_balancer(resource_name, client):
         lb = lb_response['LoadBalancers'][0]
 
         tags_response = client.describe_tags(ResourceArns=[lb_arn])
-        tags = {tag['Key']: tag['Value'] for tag_desc in tags_response.get('TagDescriptions', []) for tag in tag_desc.get('Tags', [])}
+        tags = {}
+        if tags_response.get('TagDescriptions'):
+            tags = {tag['Key']: tag['Value'] for tag in tags_response['TagDescriptions'][0].get('Tags', [])}
+
+        attributes_response = client.describe_load_balancer_attributes(LoadBalancerArn=lb_arn)
+        attributes = {
+            ''.join(['_' + c.lower() if c.isupper() else c for c in attr['Key']]).lstrip('_'): attr['Value']
+            for attr in attributes_response.get('Attributes', [])
+        }
 
         return {
             "name": lb['LoadBalancerName'],
             "internal": lb.get('Scheme') == 'internal',
             "load_balancer_type": lb['Type'],
+            "attributes": attributes,
             "security_groups": lb.get('SecurityGroups', []),
             "subnets": [az['SubnetId'] for az in lb.get('AvailabilityZones', [])],
             "tags": tags
@@ -128,6 +165,31 @@ def gerar_dados_load_balancer(resource_name, client):
 
     except ClientError as e:
         logging.error(f"Não foi possível encontrar ou acessar o Load Balancer '{lb_arn}': {e}")
+        return None
+
+def gerar_dados_ecs_task_definition(resource_name, client):
+    """Busca informações de uma Task Definition do ECS."""
+    task_def_name = resource_name
+    logging.info(f"Buscando detalhes para a Task Definition: {task_def_name}...")
+    try:
+        response = client.describe_task_definition(taskDefinition=task_def_name)
+        task_def = response['taskDefinition']
+
+        return {
+            "family": task_def['family'],
+            "container_definitions": _processar_regras_recursivamente(task_def.get('containerDefinitions', [])),
+            "cpu": task_def.get('cpu'),
+            "memory": task_def.get('memory'),
+            "network_mode": task_def.get('networkMode'),
+            "task_role_arn": task_def.get('taskRoleArn'),
+            "execution_role_arn": task_def.get('executionRoleArn'),
+            "requires_compatibilities": task_def.get('requiresCompatibilities', []),
+            "volumes": task_def.get('volumes', []),
+            "tags": {tag['key']: tag['value'] for tag in task_def.get('tags', [])}
+        }
+
+    except ClientError as e:
+        logging.error(f"Não foi possível encontrar ou acessar a Task Definition '{task_def_name}': {e}")
         return None
 
 def gerar_dados_ecs_service(resource_name, client):
@@ -178,12 +240,101 @@ def gerar_dados_cloudfront(resource_name, client):
     try:
         response = client.get_distribution_config(Id=dist_id)
         config = response['DistributionConfig']
+        tags_response = client.list_tags_for_resource(ResourceARN=response['Distribution']['ARN'])
+        tags = {tag['Key']: tag['Value'] for tag in tags_response.get('Tags', {}).get('Items', [])}
+
         return {
+            "id": dist_id,
             "enabled": config['Enabled'],
             "comment": config.get('Comment', ''),
             "price_class": config.get('PriceClass', 'PriceClass_All'),
             "is_ipv6_enabled": config.get('IsIPV6Enabled', False),
-            # Origins, behaviors, etc., são muito complexos e omitidos para simplicidade.
+            "aliases": config.get('Aliases', {}).get('Items', []),
+            "default_root_object": config.get('DefaultRootObject', ''),
+            "origins": _processar_regras_recursivamente(config.get('Origins', {}).get('Items', [])),
+            "default_cache_behavior": _processar_regras_recursivamente(config.get('DefaultCacheBehavior', {})),
+            "cache_behaviors": _processar_regras_recursivamente(config.get('CacheBehaviors', {}).get('Items', [])),
+            "custom_error_responses": _processar_regras_recursivamente(config.get('CustomErrorResponses', {}).get('Items', [])),
+            "viewer_certificate": _processar_regras_recursivamente(config.get('ViewerCertificate', {})),
+            "restrictions": _processar_regras_recursivamente(config.get('Restrictions', {})),
+            "web_acl_id": config.get('WebACLId', ''),
+            "tags": tags,
+        }
+    except ClientError as e:
+        logging.error(f"Não foi possível encontrar ou acessar a Distribuição '{dist_id}': {e}")
+        return None
+
+def gerar_dados_api_gateway(resource_name, client):
+    """Busca informações de uma REST API do API Gateway."""
+    api_name = resource_name
+    logging.info(f"Buscando detalhes para a API Gateway REST API: {api_name}...")
+    try:
+        # Encontra a API pelo nome
+        apis = client.get_rest_apis()
+        api_item = next((item for item in apis['items'] if item['name'] == api_name), None)
+        if not api_item:
+            logging.error(f"API Gateway com nome '{api_name}' não encontrada.")
+            return None
+        api_id = api_item['id']
+
+        # Exporta a definição da API no formato OpenAPI 3.0
+        export = client.get_export(
+            restApiId=api_id,
+            stageName='prod', # Um stage é necessário, pode ser necessário ajustar
+            exportType='oas30',
+            parameters={'extensions': 'integrations,authorizers'}
+        )
+        api_definition = yaml.safe_load(export['body'])
+
+        return {
+            "name": api_item['name'],
+            "description": api_item.get('description', ''),
+            "endpoint_configuration": {k.lower(): v for k, v in api_item.get('endpointConfiguration', {}).items()},
+            "tags": api_item.get('tags', {}),
+            "body": api_definition
+        }
+    except ClientError as e:
+        logging.error(f"Não foi possível encontrar ou acessar a API Gateway '{api_name}': {e}")
+        return None
+
+def gerar_dados_kms_key(resource_name, client):
+    """Busca informações de uma chave KMS."""
+    key_id_or_alias = resource_name
+    logging.info(f"Buscando detalhes para a chave KMS: {key_id_or_alias}...")
+    try:
+        response = client.describe_key(KeyId=key_id_or_alias)
+        key_metadata = response['KeyMetadata']
+
+        policy_response = client.get_key_policy(KeyId=key_metadata['KeyId'], PolicyName='default')
+        policy = yaml.safe_load(policy_response['Policy'])
+
+        tags_response = client.list_resource_tags(KeyId=key_metadata['KeyId'])
+        tags = {tag['TagKey']: tag['TagValue'] for tag in tags_response.get('Tags', [])}
+
+        return {
+            "description": key_metadata.get('Description', ''),
+            "key_usage": key_metadata.get('KeyUsage'),
+            "policy": policy,
+            "deletion_window_in_days": key_metadata.get('DeletionDate'), # Note: This shows if pending deletion
+            "is_enabled": key_metadata.get('Enabled'),
+            "tags": tags,
+        }
+    except ClientError as e:
+        logging.error(f"Não foi possível encontrar ou acessar a chave KMS '{key_id_or_alias}': {e}")
+        return None
+
+def gerar_dados_sns_topic(resource_name, client):
+    """Busca informações de um tópico SNS."""
+    topic_arn = resource_name
+    logging.info(f"Buscando detalhes para o Tópico SNS: {topic_arn}...")
+    try:
+        attributes = client.get_topic_attributes(TopicArn=topic_arn)['Attributes']
+        tags_response = client.list_tags_for_resource(ResourceARN=topic_arn)
+        tags = {tag['Key']: tag['Value'] for tag in tags_response.get('Tags', [])}
+        return {
+            "name": attributes['DisplayName'],
+            "policy": yaml.safe_load(attributes['Policy']),
+            "tags": tags,
         }
     except ClientError as e:
         logging.error(f"Não foi possível encontrar ou acessar a Distribuição '{dist_id}': {e}")
@@ -215,6 +366,11 @@ RESOURCE_MAP = {
         'generator': gerar_dados_load_balancer,
         'template': 'load_balancer.tf.tpl'
     },
+    'ecs_task_definition': {
+        'client': 'ecs',
+        'generator': gerar_dados_ecs_task_definition,
+        'template': 'ecs_task_definition.tf.tpl'
+    },
     'ecs_service': {
         'client': 'ecs',
         'generator': gerar_dados_ecs_service,
@@ -224,6 +380,21 @@ RESOURCE_MAP = {
         'client': 'cloudfront',
         'generator': gerar_dados_cloudfront,
         'template': 'cloudfront.tf.tpl'
+    },
+    'api_gateway': {
+        'client': 'apigateway',
+        'generator': gerar_dados_api_gateway,
+        'template': 'api_gateway.tf.tpl'
+    },
+    'kms': {
+        'client': 'kms',
+        'generator': gerar_dados_kms_key,
+        'template': 'kms.tf.tpl'
+    },
+    'sns': {
+        'client': 'sns',
+        'generator': gerar_dados_sns_topic,
+        'template': 'sns.tf.tpl'
     },
 }
 
@@ -240,6 +411,8 @@ def main(yaml_file, output_dir):
         resources_to_generate = yaml.safe_load(f)
 
     root_main_tf_content = ""
+    # Cache de clientes Boto3 para reutilização
+    boto_clients = {}
 
     for resource_type, resource_list in resources_to_generate.items():
         if resource_type not in RESOURCE_MAP:
@@ -249,7 +422,12 @@ def main(yaml_file, output_dir):
         config = RESOURCE_MAP[resource_type]
         generator_func = config['generator']
         template_file = config['template']
-        client = boto3.client(config['client'], region_name="us-east-1")
+        client_name = config['client']
+
+        # Reutiliza ou cria o cliente Boto3
+        if client_name not in boto_clients:
+            boto_clients[client_name] = boto3.client(client_name, region_name="us-east-1")
+        client = boto_clients[client_name]
 
         for resource_name in resource_list:
             module_name_suffix = resource_name if isinstance(resource_name, str) else resource_name.get('name', resource_name.get('service', 'default'))
