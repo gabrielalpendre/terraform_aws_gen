@@ -16,11 +16,9 @@ resource "aws_lambda_function" "this" {
   # Para funções baseadas em imagem
   image_uri = local.config.package_type == "Image" ? local.config.image_uri : null
 
-  # Para funções baseadas em Zip (requer preenchimento manual do bucket/key no config.yaml)
-  s3_bucket        = local.config.package_type == "Zip" ? try(local.config.s3_bucket, null) : null
-  s3_key           = local.config.package_type == "Zip" ? try(local.config.s3_key, null) : null
-  s3_object_version = local.config.package_type == "Zip" ? try(local.config.s3_object_version, null) : null
-  source_code_hash = local.config.package_type == "Zip" ? try(local.config.source_code_hash, null) : null
+  # Para funções baseadas em Zip, usa o arquivo baixado localmente.
+  filename         = local.config.package_type == "Zip" ? try(local.config.filename, null) : null
+  source_code_hash = local.config.package_type == "Zip" ? (try(local.config.filename, null) != null ? filebase64sha256("${path.module}/${local.config.filename}") : null) : null
 
   dynamic "environment" {
     for_each = length(keys(try(local.config.environment_variables, {}))) > 0 ? [1] : []

@@ -4,6 +4,7 @@ import boto3
 import logging
 from botocore.exceptions import ClientError
 
+import requests # Adicionado para baixar o código da função
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def gerar_dados_s3(resource_name, client):
@@ -54,7 +55,7 @@ def gerar_dados_s3(resource_name, client):
         logging.error(f"Não foi possível encontrar ou acessar o bucket S3 '{bucket_name}': {e}")
         return None
 
-def gerar_dados_lambda(resource_name, client):
+def gerar_dados_lambda(resource_name, client, module_path):
     """
     Busca informações de uma função Lambda. resource_name deve ser um dict com a chave 'name'.
     """
@@ -70,6 +71,21 @@ def gerar_dados_lambda(resource_name, client):
         filesystem_configs = [{ 'arn': fsc['Arn'], 'local_mount_path': fsc['LocalMountPath'] } for fsc in config.get('FileSystemConfigs', [])]
 
         package_type = config.get('PackageType')
+        filename = None
+
+        if package_type == 'Zip':
+            # A API não fornece o bucket/key de origem, então baixamos o código.
+            code_location = response.get('Code', {}).get('Location')
+            if code_location:
+                try:
+                    logging.info(f"Baixando código da função '{function_name}'...")
+                    zip_content = requests.get(code_location).content
+                    filename = f"{function_name}_source.zip"
+                    with open(os.path.join(module_path, filename), 'wb') as f:
+                        f.write(zip_content)
+                except requests.RequestException as e:
+                    logging.error(f"Falha ao baixar o código da função '{function_name}': {e}")
+                    filename = None
 
         return {
             "function_name": config['FunctionName'],
@@ -82,9 +98,7 @@ def gerar_dados_lambda(resource_name, client):
             "memory_size": config.get('MemorySize', 128),
             "package_type": package_type,
             "image_uri": code_info.get('ImageUri') if package_type == 'Image' else None, # Correctly fetch from code_info
-            "s3_bucket": None, # API does not provide this, must be set manually for Zip
-            "s3_key": None,    # API does not provide this, must be set manually for Zip
-            "source_code_hash": config.get('CodeSha256'), # Available for both types
+            "filename": filename, # Caminho para o arquivo .zip baixado
             "environment_variables": env_vars,
             "dead_letter_config": config.get('DeadLetterConfig', {}),
             "kms_key_arn": config.get('KMSKeyArn', ''),
@@ -454,6 +468,7 @@ def main(yaml_file, output_dir):
     """Função principal que orquestra a geração do Terraform."""
     logging.info(f"Iniciando geração de Terraform a partir de '{yaml_file}'")
     criar_diretorios(output_dir)
+    _ensure_requests_installed()
 
     with open(yaml_file, 'r') as f:
         resources_to_generate = yaml.safe_load(f)
@@ -491,12 +506,13 @@ def main(yaml_file, output_dir):
                     break
 
             safe_module_name = "".join(c if c.isalnum() else '_' for c in module_name_suffix)
-            data_dict = generator_func(resource_item, client)
+            module_path = os.path.join(output_dir, 'modules', resource_type, safe_module_name)
+            os.makedirs(module_path, exist_ok=True)
+
+            # Passa o module_path para o gerador, caso ele precise salvar arquivos (ex: Lambda zip)
+            data_dict = generator_func(resource_item, client, module_path=module_path) if resource_type == 'lambda' else generator_func(resource_item, client)
 
             if data_dict:
-                module_path = os.path.join(output_dir, 'modules', resource_type, safe_module_name)
-                os.makedirs(module_path, exist_ok=True)
-
                 with open(os.path.join(module_path, 'config.yaml'), 'w') as yf:
                     yaml.dump(data_dict, yf, default_flow_style=False, sort_keys=False)
 
@@ -529,6 +545,7 @@ def main(yaml_file, output_dir):
 if __name__ == '__main__':
     INPUT_YAML = 'resources.yaml'
     OUTPUT_DIR = 'terraform'
+    # pip install requests
     
     if not os.path.exists(INPUT_YAML):
         logging.error(f"Arquivo de entrada '{INPUT_YAML}' não encontrado. Crie-o com a lista de recursos.")
