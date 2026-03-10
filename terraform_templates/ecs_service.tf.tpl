@@ -6,14 +6,10 @@ resource "aws_ecs_service" "this" {
   launch_type     = local.config.launch_type
 
   scheduling_strategy = try(local.config.scheduling_strategy, "REPLICA")
-
-  dynamic "deployment_configuration" {
-    for_each = try(local.config.deployment_controller.type, "ECS") != "CODE_DEPLOY" && try(local.config.deployment_configuration, null) != null ? [1] : []
-    content {
-      maximum_percent        = try(local.config.deployment_configuration.maximum_percent, 200)
-      minimum_healthy_percent = try(local.config.deployment_configuration.minimum_healthy_percent, 100)
-    }
-  }
+  
+  # Arguments for the default ECS deployment controller (rolling update)
+  deployment_maximum_percent         = try(local.config.deployment_configuration.maximum_percent, null)
+  deployment_minimum_healthy_percent = try(local.config.deployment_configuration.minimum_healthy_percent, null)
 
   dynamic "network_configuration" {
     for_each = local.config.launch_type == "FARGATE" ? [1] : []

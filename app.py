@@ -70,17 +70,6 @@ def gerar_dados_lambda(resource_name, client):
         filesystem_configs = [{ 'arn': fsc['Arn'], 'local_mount_path': fsc['LocalMountPath'] } for fsc in config.get('FileSystemConfigs', [])]
 
         package_type = config.get('PackageType')
-        image_uri = None
-        s3_bucket = None
-        s3_key = None
-        code_sha_256 = None
-        code_size = None
-
-        if package_type == 'Image':
-            image_uri = code_info.get('ImageUri')
-        elif package_type == 'Zip':
-            code_sha_256 = config.get('CodeSha256')
-            code_size = config.get('CodeSize')
 
         return {
             "function_name": config['FunctionName'],
@@ -92,20 +81,16 @@ def gerar_dados_lambda(resource_name, client):
             "timeout": config.get('Timeout', 3),
             "memory_size": config.get('MemorySize', 128),
             "package_type": package_type,
-            "image_uri": code_info.get('ImageUri') if package_type == 'Image' else None,
-            "source_code_hash": config.get('CodeSha256'),
+            "image_uri": code_info.get('ImageUri') if package_type == 'Image' else None, # Correctly fetch from code_info
+            "s3_bucket": None, # API does not provide this, must be set manually for Zip
+            "s3_key": None,    # API does not provide this, must be set manually for Zip
+            "source_code_hash": config.get('CodeSha256'), # Available for both types
             "environment_variables": env_vars,
             "dead_letter_config": config.get('DeadLetterConfig', {}),
             "kms_key_arn": config.get('KMSKeyArn', ''),
             "tracing_config": config.get('TracingConfig', {}),
             "layers": layers,
             "filesystem_configs": filesystem_configs,
-            "package_type": package_type,
-            "image_uri": image_uri,
-            "s3_bucket": s3_bucket,
-            "s3_key": s3_key,
-            "code_sha_256": code_sha_256,
-            "code_size": code_size,
             "vpc_config": config.get('VpcConfig', {}),
             "tags": response.get('Tags', {})
         }

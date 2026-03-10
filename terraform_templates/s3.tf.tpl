@@ -16,8 +16,8 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
 
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm     = local.config.server_side_encryption_configuration.rules[0].apply_server_side_encryption_by_default.sse_algorithm
-      kms_master_key_id = try(local.config.server_side_encryption_configuration.rules[0].apply_server_side_encryption_by_default.kms_master_key_id, null)
+      sse_algorithm     = local.config.server_side_encryption_configuration.rules[0].apply_server_side_encryption_by_default.s_s_e_algorithm
+      kms_master_key_id = try(local.config.server_side_encryption_configuration.rules[0].apply_server_side_encryption_by_default.k_m_s_master_key_id, null)
     }
   }
 }
