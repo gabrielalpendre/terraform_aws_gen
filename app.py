@@ -10,7 +10,7 @@ def gerar_dados_s3(resource_name, client):
     """
     Busca informações de um bucket S3. resource_name deve ser um dict com a chave 'name'.
     """
-    bucket_name = resource_name
+    bucket_name = resource_name['name']
     logging.info(f"Buscando detalhes para o bucket S3: {bucket_name}...")
     try:
 
