@@ -258,19 +258,27 @@ def gerar_dados_ecs_service(resource_name, client):
             return None
         service = response['services'][0]
 
+        deployment_controller = service.get('deploymentController', {})
         net_config = service.get('networkConfiguration', {}).get('awsvpcConfiguration', {})
 
-        load_balancers = [
-            {
-                "target_group_arn": lb.get('targetGroupArn'),
-                "container_name": lb.get('containerName'),
-                "container_port": lb.get('containerPort'),
-            } for lb in service.get('loadBalancers', [])
-        ]
-
-        deployment_controller = service.get('deploymentController', {})
+        load_balancers = []
         if deployment_controller.get('type') == 'CODE_DEPLOY':
-            pass
+            load_balancers = [
+                {
+                    "target_group_arn": lb.get('targetGroupArn'),
+                    "container_name": lb.get('containerName'),
+                    "container_port": lb.get('containerPort'),
+                    "deployment_controller": deployment_controller,
+                } for lb in service.get('loadBalancers', [])
+            ]
+        else:
+            load_balancers = [
+                {
+                    "target_group_arn": lb.get('targetGroupArn'),
+                    "container_name": lb.get('containerName'),
+                    "container_port": lb.get('containerPort'),
+                } for lb in service.get('loadBalancers', [])
+            ]
         return {
             "name": service['serviceName'],
             "cluster": cluster_name,
