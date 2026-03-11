@@ -200,10 +200,7 @@ def gerar_dados_load_balancer(resource_name, client):
             tags = {tag['Key']: tag['Value'] for tag in tags_response['TagDescriptions'][0].get('Tags', [])}
 
         attributes_response = client.describe_load_balancer_attributes(LoadBalancerArn=lb_arn)
-        attributes = {
-            ''.join(['_' + c.lower() if c.isupper() else c for c in attr['Key']]).lstrip('_'): attr['Value']
-            for attr in attributes_response.get('Attributes', [])
-        }
+        attributes = {attr['Key'].replace('.', '_'): attr['Value'] for attr in attributes_response.get('Attributes', [])}
 
         return {
             "name": lb['LoadBalancerName'],
@@ -237,7 +234,7 @@ def gerar_dados_ecs_task_definition(resource_name, client):
             "execution_role_arn": task_def.get('executionRoleArn'),
             "requires_compatibilities": task_def.get('requiresCompatibilities', []),
             "volumes": _processar_regras_recursivamente(task_def.get('volumes', [])),
-            "placement_constraints": _processar_regras_recursivamente(task_def.get('placementConstraints', [])),
+            "placement_constraints": _processar_regras_recursivamente(task_def.get('placementConstraints', [])), # Note: 'key' and 'value' for tags are lowercase in boto3 response
             "proxy_configuration": _processar_regras_recursivamente(task_def.get('proxyConfiguration')),
             "tags": {tag['key']: tag['value'] for tag in task_def.get('tags', [])}
         }
@@ -261,39 +258,29 @@ def gerar_dados_ecs_service(resource_name, client):
         deployment_controller = service.get('deploymentController', {})
         net_config = service.get('networkConfiguration', {}).get('awsvpcConfiguration', {})
 
-        load_balancers = []
-        if deployment_controller.get('type') == 'CODE_DEPLOY':
-            load_balancers = [
-                {
-                    "target_group_arn": lb.get('targetGroupArn'),
-                    "container_name": lb.get('containerName'),
-                    "container_port": lb.get('containerPort'),
-                    "deployment_controller": deployment_controller,
-                } for lb in service.get('loadBalancers', [])
-            ]
-        else:
-            load_balancers = [
-                {
-                    "target_group_arn": lb.get('targetGroupArn'),
-                    "container_name": lb.get('containerName'),
-                    "container_port": lb.get('containerPort'),
-                } for lb in service.get('loadBalancers', [])
-            ]
+        load_balancers = [
+            {
+                "target_group_arn": lb.get('targetGroupArn'),
+                "container_name": lb.get('containerName'),
+                "container_port": lb.get('containerPort'),
+            } for lb in service.get('loadBalancers', [])
+        ]
+
         return {
             "name": service['serviceName'],
-            "cluster": cluster_name,
+            "cluster": cluster_name, # O ARN completo do cluster é retornado, o que é ideal.
             "task_definition": service.get('taskDefinition'),
             "scheduling_strategy": service.get('schedulingStrategy', 'REPLICA'),
             "deployment_configuration": _processar_regras_recursivamente(service.get('deploymentConfiguration')),
             "desired_count": service.get('desiredCount', 1),
             "launch_type": service.get('launchType', 'FARGATE'),
             "network_configuration": {
-                "subnets": net_config.get('subnets', []),
+                "subnets": net_config.get('subnets', []), # 'subnets' é com 's' no final
                 "security_groups": net_config.get('securityGroups', []),
                 "assign_public_ip": net_config.get('assignPublicIp') == 'ENABLED',
             },
             "load_balancers": load_balancers,
-            "deployment_controller": deployment_controller,
+            "deployment_controller": _processar_regras_recursivamente(deployment_controller),
             "service_registries": _processar_regras_recursivamente(service.get('serviceRegistries', [])),
             "health_check_grace_period_seconds": service.get('healthCheckGracePeriodSeconds'),
             "enable_ecs_managed_tags": service.get('enableECSManagedTags', False),
@@ -319,13 +306,13 @@ def gerar_dados_cloudfront(resource_name, client):
             "id": dist_id,
             "enabled": config['Enabled'],
             "comment": config.get('Comment', ''),
-            "price_class": config.get('PriceClass', 'PriceClass_All'),
+            "price_class": config.get('PriceClass', 'PriceClass_All'), # Ex: PriceClass_100
             "is_ipv6_enabled": config.get('IsIPV6Enabled', False),
-            "aliases": config.get('Aliases', {}).get('Items', []),
+            "aliases": _processar_regras_recursivamente(config.get('Aliases', {}).get('Items', [])),
             "default_root_object": config.get('DefaultRootObject', ''),
-            "origins": _processar_regras_recursivamente(config.get('Origins', {}).get('Items', [])),
+            "origins": _processar_regras_recursivamente(config.get('Origins', {}).get('Items', [])), # 'origins' é com 's'
             "default_cache_behavior": _processar_regras_recursivamente(config.get('DefaultCacheBehavior', {})),
-            "cache_behaviors": _processar_regras_recursivamente(config.get('CacheBehaviors', {}).get('Items', [])),
+            "ordered_cache_behavior": _processar_regras_recursivamente(config.get('CacheBehaviors', {}).get('Items', [])),
             "custom_error_responses": _processar_regras_recursivamente(config.get('CustomErrorResponses', {}).get('Items', [])),
             "viewer_certificate": _processar_regras_recursivamente(config.get('ViewerCertificate', {})),
             "restrictions": _processar_regras_recursivamente(config.get('Restrictions', {})),
@@ -359,7 +346,7 @@ def gerar_dados_api_gateway(resource_name, client):
         return {
             "name": api_item['name'],
             "description": api_item.get('description', ''),
-            "endpoint_configuration": {k.lower(): v for k, v in api_item.get('endpointConfiguration', {}).items()},
+            "endpoint_configuration": _processar_regras_recursivamente(api_item.get('endpointConfiguration', {})),
             "tags": api_item.get('tags', {}),
             "body": api_definition
         }
@@ -374,18 +361,23 @@ def gerar_dados_kms_key(resource_name, client):
     try:
         response = client.describe_key(KeyId=key_id_or_alias)
         key_metadata = response['KeyMetadata']
-
+        key_id = key_metadata['KeyId']
+ 
         policy_response = client.get_key_policy(KeyId=key_metadata['KeyId'], PolicyName='default')
         policy = yaml.safe_load(policy_response['Policy'])
-
+ 
         tags_response = client.list_resource_tags(KeyId=key_metadata['KeyId'])
         tags = {tag['TagKey']: tag['TagValue'] for tag in tags_response.get('Tags', [])}
-
+ 
+        # O Terraform espera 'deletion_window_in_days', não um timestamp.
+        # Se a chave não estiver pendente de exclusão, este campo não deve ser definido.
+        deletion_window = None
+ 
         return {
             "description": key_metadata.get('Description', ''),
             "key_usage": key_metadata.get('KeyUsage'),
-            "policy": policy,
-            "deletion_window_in_days": key_metadata.get('DeletionDate'), # Note: This shows if pending deletion
+            "policy": policy, # A política é um objeto JSON, o que é correto.
+            "deletion_window_in_days": deletion_window,
             "is_enabled": key_metadata.get('Enabled'),
             "tags": tags,
         }

@@ -81,13 +81,37 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$ACTION" ]; then
-    ACTION="plan"
+    echo "Nenhuma ação especificada. Por favor, selecione uma:"
+    actions=("plan" "apply" "destroy")
+    PS3="Digite o número da ação: "
+    select act in "${actions[@]}"; do
+        if [[ -n "$act" ]]; then
+            ACTION=$act
+            break
+        fi
+        echo "Opção inválida. Tente novamente."
+    done
+    echo "" # Adiciona uma linha em branco para melhor legibilidade
 fi
 
 if [ -z "$TARGET_INPUT" ]; then
-    echo "Erro: Nenhum nome de módulo alvo especificado. Use a flag -m ou --module."
-    show_help
-    exit 1
+    echo "Nenhum módulo especificado. Por favor, selecione um da lista abaixo:"
+    mapfile -t modules < <(grep -oP 'module "\K[^"]+' "main.tf")
+
+    if [ ${#modules[@]} -eq 0 ]; then
+        echo "Erro: Nenhum módulo encontrado em 'main.tf'. Execute o app.py primeiro."
+        exit 1
+    fi
+
+    # Usa 'select' para criar o menu
+    PS3="Digite o número do módulo: "
+    select opt in "${modules[@]}"; do
+        if [[ -n "$opt" ]]; then
+            TARGET_INPUT=$opt
+            break
+        fi
+        echo "Opção inválida. Tente novamente."
+    done
 fi
 
 # --- Lógica Principal ---
