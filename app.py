@@ -1,4 +1,5 @@
 import os
+import re
 import yaml
 import boto3
 import logging
@@ -114,13 +115,20 @@ def gerar_dados_lambda(resource_name, client, module_path):
         return None
 
 def _processar_regras_recursivamente(obj):
-    """Converte recursivamente as chaves de um objeto de PascalCase para snake_case."""
+    """Converte recursivamente as chaves de um objeto de PascalCase para snake_case.
+    
+    Trata corretamente siglas consecutivas (ex: HTTPPort → http_port, SSLProtocol → ssl_protocol).
+    Padrão:
+      - Sequência de maiúsculas seguida de maiúscula+minúscula: 'SSLPort' → ['SSL', 'Port']
+      - Minúscula seguida de maiúscula: 'originPath' → ['origin', 'Path']
+    """
+    def to_snake(name):
+        s1 = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', name)
+        s2 = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s1)
+        return s2.lower().replace("cloud_watch", "cloudwatch")
+
     if isinstance(obj, dict):
-        new_dict = {}
-        for k, v in obj.items():
-            new_key = ''.join(['_' + c.lower() if c.isupper() else c for c in k]).lstrip('_')
-            new_dict[new_key] = _processar_regras_recursivamente(v)
-        return new_dict
+        return {to_snake(k): _processar_regras_recursivamente(v) for k, v in obj.items()}
     elif isinstance(obj, list):
         return [_processar_regras_recursivamente(elem) for elem in obj]
     else:
@@ -330,8 +338,8 @@ def gerar_dados_ecs_service(resource_name, client):
             "scheduling_strategy": service.get('schedulingStrategy', 'REPLICA'),
             "deployment_configuration": processed_deployment_config,
             "desired_count": service.get('desiredCount', 1),
-            "deployment_maximum_percent": deployment_config.get('maximumPercent') if deployment_config else None,
-            "deployment_minimum_healthy_percent": deployment_config.get('minimumHealthyPercent') if deployment_config else None,
+            "deployment_maximum_percent": (deployment_config or {}).get('maximumPercent'),
+            "deployment_minimum_healthy_percent": (deployment_config or {}).get('minimumHealthyPercent'),
             "launch_type": service.get('launchType', 'FARGATE'),
             "network_configuration": {
                 "subnets": net_config.get('subnets', []),
@@ -356,9 +364,10 @@ def gerar_dados_cloudfront(resource_name, client):
     dist_id = resource_name['id']
     logging.info(f"Buscando detalhes para a Distribuição CloudFront: {dist_id}...")
     try:
-        response = client.get_distribution_config(Id=dist_id)
-        config = response['DistributionConfig']
-        tags_response = client.list_tags_for_resource(ResourceARN=response['Distribution']['ARN'])
+        response = client.get_distribution(Id=dist_id)
+        dist_data = response['Distribution']
+        config = dist_data['DistributionConfig']
+        tags_response = client.list_tags_for_resource(Resource=dist_data['ARN'])
         tags = {tag['Key']: tag['Value'] for tag in tags_response.get('Tags', {}).get('Items', [])}
 
         return {

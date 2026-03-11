@@ -33,3 +33,5 @@ override.tf.json
 terraform/modules/
 terraform/main.tf
 resources*.yaml
+*.txt
+*.log

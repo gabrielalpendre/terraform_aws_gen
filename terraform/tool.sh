@@ -150,6 +150,9 @@ INTERNAL_ADDRESS=$(echo "$RESOURCE_LINE" | awk -F'"' '{print $2 "." $4}')
 MODULE_TARGET="module.${TARGET_INPUT}.${INTERNAL_ADDRESS}"
 
 if [ "$SKIP_VALIDATE" = false ]; then
+    echo "--> Inicializando módulos (init)..."
+    terraform init -backend=false -input=false -no-color > /dev/null
+
     echo "--> Validando a configuração geral do Terraform..."
     if ! terraform validate -no-color; then
         echo "------------------------------------------------------------------------"
