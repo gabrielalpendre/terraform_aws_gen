@@ -2,9 +2,10 @@ import os
 import yaml
 import boto3
 import logging
+import requests
 from botocore.exceptions import ClientError
 
-import requests # Adicionado para baixar o código da função
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def gerar_dados_s3(resource_name, client):
@@ -74,7 +75,6 @@ def gerar_dados_lambda(resource_name, client, module_path):
         filename = None
 
         if package_type == 'Zip':
-            # A API não fornece o bucket/key de origem, então baixamos o código.
             code_location = response.get('Code', {}).get('Location')
             if code_location:
                 try:
@@ -97,8 +97,8 @@ def gerar_dados_lambda(resource_name, client, module_path):
             "timeout": config.get('Timeout', 3),
             "memory_size": config.get('MemorySize', 128),
             "package_type": package_type,
-            "image_uri": code_info.get('ImageUri') if package_type == 'Image' else None, # Correctly fetch from code_info
-            "filename": filename, # Caminho para o arquivo .zip baixado
+            "image_uri": code_info.get('ImageUri') if package_type == 'Image' else None,
+            "filename": filename,
             "environment_variables": env_vars,
             "dead_letter_config": config.get('DeadLetterConfig', {}),
             "kms_key_arn": config.get('KMSKeyArn', ''),
@@ -234,7 +234,7 @@ def gerar_dados_ecs_task_definition(resource_name, client):
             "execution_role_arn": task_def.get('executionRoleArn'),
             "requires_compatibilities": task_def.get('requiresCompatibilities', []),
             "volumes": _processar_regras_recursivamente(task_def.get('volumes', [])),
-            "placement_constraints": _processar_regras_recursivamente(task_def.get('placementConstraints', [])), # Note: 'key' and 'value' for tags are lowercase in boto3 response
+            "placement_constraints": _processar_regras_recursivamente(task_def.get('placementConstraints', [])),
             "proxy_configuration": _processar_regras_recursivamente(task_def.get('proxyConfiguration')),
             "tags": {tag['key']: tag['value'] for tag in task_def.get('tags', [])}
         }
@@ -253,34 +253,93 @@ def gerar_dados_ecs_service(resource_name, client):
         if not response.get('services'):
             logging.error(f"Service ECS '{service_name}' no cluster '{cluster_name}' não encontrado.")
             return None
+
         service = response['services'][0]
 
         deployment_controller = service.get('deploymentController', {})
+        deployment_config = service.get('deploymentConfiguration')
         net_config = service.get('networkConfiguration', {}).get('awsvpcConfiguration', {})
 
-        load_balancers = [
-            {
+        load_balancers_config = []
+        raw_load_balancers = service.get('loadBalancers', [])
+        processed_deployment_config = _processar_regras_recursivamente(deployment_config) if deployment_config else None
+
+        is_native_canary = processed_deployment_config and 'canary_configuration' in processed_deployment_config
+
+        if is_native_canary and raw_load_balancers:
+            try:
+                elbv2_client = boto3.client('elbv2', region_name="us-east-1")
+                main_tg_arn = raw_load_balancers[0]['targetGroupArn']
+
+                tg_details_response = elbv2_client.describe_target_groups(TargetGroupArns=[main_tg_arn])
+                if not tg_details_response['TargetGroups']: raise ValueError("Target Group não encontrado.")
+                lb_arn = tg_details_response['TargetGroups'][0]['LoadBalancerArns'][0]
+
+                listeners_response = elbv2_client.describe_listeners(LoadBalancerArn=lb_arn)
+                production_listener_rule_arn = None
+                alternate_target_group_arn = None
+
+                for listener in listeners_response['Listeners']:
+                    rules_response = elbv2_client.describe_rules(ListenerArn=listener['ListenerArn'])
+                    for rule in rules_response['Rules']:
+                        forward_actions = [action for action in rule['Actions'] if action['Type'] == 'forward' and 'ForwardConfig' in action]
+                        if not forward_actions: continue
+
+                        target_groups = forward_actions[0]['ForwardConfig']['TargetGroups']
+                        tg_arns_in_rule = [tg['TargetGroupArn'] for tg in target_groups]
+
+                        if main_tg_arn in tg_arns_in_rule and len(tg_arns_in_rule) > 1:
+                            production_listener_rule_arn = rule['RuleArn']
+                            alternate_target_group_arn = next((arn for arn in tg_arns_in_rule if arn != main_tg_arn), None)
+                            break
+                    if production_listener_rule_arn: break
+                
+                if not all([production_listener_rule_arn, alternate_target_group_arn]):
+                    raise ValueError("Não foi possível encontrar a regra do listener ou o target group alternativo para a configuração canary.")
+
+                for lb in raw_load_balancers:
+                    load_balancers_config.append({
+                        "target_group_arn": lb.get('targetGroupArn'),
+                        "container_name": lb.get('containerName'),
+                        "container_port": lb.get('containerPort'),
+                        "advanced_configuration": {
+                            "alternate_target_group_arn": alternate_target_group_arn,
+                            "production_listener_rule_arn": production_listener_rule_arn,
+                            "role_arn": service.get('roleArn')
+                        }
+                    })
+            except (ClientError, ValueError, IndexError) as e:
+                logging.error(f"Falha ao descobrir a configuração canary para o serviço '{service_name}': {e}")
+                return None # Aborta a geração deste módulo se a descoberta falhar
+        elif deployment_controller.get('type') == 'CODE_DEPLOY':
+            processed_deployment_controller = _processar_regras_recursivamente(deployment_controller)
+            for lb in raw_load_balancers:
+                load_balancers_config.append(_processar_regras_recursivamente({**lb, "deployment_controller": processed_deployment_controller}))
+            processed_deployment_config = None
+        else:
+            load_balancers_config = [{
                 "target_group_arn": lb.get('targetGroupArn'),
                 "container_name": lb.get('containerName'),
                 "container_port": lb.get('containerPort'),
-            } for lb in service.get('loadBalancers', [])
-        ]
+            } for lb in raw_load_balancers]
 
         return {
             "name": service['serviceName'],
-            "cluster": cluster_name, # O ARN completo do cluster é retornado, o que é ideal.
+            "cluster": cluster_name,
             "task_definition": service.get('taskDefinition'),
             "scheduling_strategy": service.get('schedulingStrategy', 'REPLICA'),
-            "deployment_configuration": _processar_regras_recursivamente(service.get('deploymentConfiguration')),
+            "deployment_configuration": processed_deployment_config,
             "desired_count": service.get('desiredCount', 1),
+            "deployment_maximum_percent": deployment_config.get('maximumPercent') if deployment_config else None,
+            "deployment_minimum_healthy_percent": deployment_config.get('minimumHealthyPercent') if deployment_config else None,
             "launch_type": service.get('launchType', 'FARGATE'),
             "network_configuration": {
-                "subnets": net_config.get('subnets', []), # 'subnets' é com 's' no final
+                "subnets": net_config.get('subnets', []),
                 "security_groups": net_config.get('securityGroups', []),
                 "assign_public_ip": net_config.get('assignPublicIp') == 'ENABLED',
             },
-            "load_balancers": load_balancers,
-            "deployment_controller": _processar_regras_recursivamente(deployment_controller),
+            "load_balancers": load_balancers_config,
+            "deployment_controller": {} if is_native_canary or not deployment_controller else _processar_regras_recursivamente(deployment_controller),
             "service_registries": _processar_regras_recursivamente(service.get('serviceRegistries', [])),
             "health_check_grace_period_seconds": service.get('healthCheckGracePeriodSeconds'),
             "enable_ecs_managed_tags": service.get('enableECSManagedTags', False),
@@ -310,7 +369,7 @@ def gerar_dados_cloudfront(resource_name, client):
             "is_ipv6_enabled": config.get('IsIPV6Enabled', False),
             "aliases": _processar_regras_recursivamente(config.get('Aliases', {}).get('Items', [])),
             "default_root_object": config.get('DefaultRootObject', ''),
-            "origins": _processar_regras_recursivamente(config.get('Origins', {}).get('Items', [])), # 'origins' é com 's'
+            "origins": _processar_regras_recursivamente(config.get('Origins', {}).get('Items', [])),
             "default_cache_behavior": _processar_regras_recursivamente(config.get('DefaultCacheBehavior', {})),
             "ordered_cache_behavior": _processar_regras_recursivamente(config.get('CacheBehaviors', {}).get('Items', [])),
             "custom_error_responses": _processar_regras_recursivamente(config.get('CustomErrorResponses', {}).get('Items', [])),
@@ -369,14 +428,12 @@ def gerar_dados_kms_key(resource_name, client):
         tags_response = client.list_resource_tags(KeyId=key_metadata['KeyId'])
         tags = {tag['TagKey']: tag['TagValue'] for tag in tags_response.get('Tags', [])}
  
-        # O Terraform espera 'deletion_window_in_days', não um timestamp.
-        # Se a chave não estiver pendente de exclusão, este campo não deve ser definido.
         deletion_window = None
  
         return {
             "description": key_metadata.get('Description', ''),
             "key_usage": key_metadata.get('KeyUsage'),
-            "policy": policy, # A política é um objeto JSON, o que é correto.
+            "policy": policy,
             "deletion_window_in_days": deletion_window,
             "is_enabled": key_metadata.get('Enabled'),
             "tags": tags,
@@ -504,7 +561,6 @@ def main(yaml_file, output_dir):
             module_path = os.path.join(output_dir, 'modules', resource_type, safe_module_name)
             os.makedirs(module_path, exist_ok=True)
 
-            # Passa o module_path para o gerador, caso ele precise salvar arquivos (ex: Lambda zip)
             data_dict = generator_func(resource_item, client, module_path=module_path) if resource_type == 'lambda' else generator_func(resource_item, client)
 
             if data_dict:
@@ -540,7 +596,6 @@ def main(yaml_file, output_dir):
 if __name__ == '__main__':
     INPUT_YAML = 'resources.yaml'
     OUTPUT_DIR = 'terraform'
-    # pip install requests
     
     if not os.path.exists(INPUT_YAML):
         logging.error(f"Arquivo de entrada '{INPUT_YAML}' não encontrado. Crie-o com a lista de recursos.")
